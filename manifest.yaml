@@ -1,0 +1,13 @@
+manifestVersion: 1
+name: "@keeb/jellyfin"
+version: "2026.04.02.1"
+description: "Jellyfin media server integration — library inventory, audit, and unidentified media detection"
+labels:
+  - jellyfin
+  - media
+  - library
+models:
+  - jellyfin.ts
+reports:
+  - library_audit.ts
+  - unidentified_media.ts
