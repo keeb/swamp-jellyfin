@@ -1,7 +1,12 @@
 manifestVersion: 1
 name: "@keeb/jellyfin"
-version: "2026.04.06.1"
+version: "2026.05.06.1"
 description: "Jellyfin media server integration — library inventory, audit, and unidentified media detection"
+repository: https://github.com/keeb/swamp-jellyfin
+platforms: []
+additionalFiles:
+  - README.md
+  - LICENSE.txt
 labels:
   - jellyfin
   - media

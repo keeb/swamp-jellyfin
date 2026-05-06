@@ -47,13 +47,38 @@ const UnidentifiedReportSchema = z.object({
   count: z.number(),
 });
 
+const SeriesListItemSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  path: z.string().optional(),
+  productionYear: z.number().optional(),
+  communityRating: z.number().optional(),
+  officialRating: z.string().optional(),
+  overview: z.string().optional(),
+  genres: z.array(z.string()),
+  tags: z.array(z.string()),
+  studios: z.array(z.string()),
+  providerIds: z.record(z.string(), z.string()),
+  episodeCount: z.number().optional(),
+  endDate: z.string().optional(),
+  status: z.string().optional(),
+});
+
+const SeriesListSchema = z.object({
+  timestamp: z.iso.datetime(),
+  library: z.string(),
+  libraryId: z.string(),
+  count: z.number(),
+  items: z.array(SeriesListItemSchema),
+});
+
 function headers(apiKey: string): Record<string, string> {
   return { "X-Emby-Token": apiKey };
 }
 
 export const model = {
   type: "@keeb/jellyfin",
-  version: "2026.03.30.1",
+  version: "2026.04.26.1",
   reports: ["@keeb/unidentified-media", "@keeb/library-audit"],
   globalArguments: GlobalArgsSchema,
   resources: {
@@ -114,6 +139,13 @@ export const model = {
       lifetime: "infinite" as const,
       garbageCollection: 10,
     },
+    series: {
+      description:
+        "Per-library listing of series with genres, tags, overview, and provider IDs",
+      schema: SeriesListSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 5,
+    },
     identification: {
       description: "Result of identifying items via metadata search",
       schema: z.object({
@@ -129,6 +161,17 @@ export const model = {
         ),
         matched: z.number(),
         failed: z.number(),
+      }),
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
+    encodingConfig: {
+      description:
+        "Snapshot of Jellyfin's EncodingOptions (server-wide transcoding config)",
+      schema: z.object({
+        timestamp: z.iso.datetime(),
+        action: z.enum(["read", "updated"]),
+        config: z.record(z.string(), z.unknown()),
       }),
       lifetime: "infinite" as const,
       garbageCollection: 10,
@@ -159,6 +202,97 @@ export const model = {
           timestamp: new Date().toISOString(),
           status: "started",
           detail: "Full library refresh triggered",
+        });
+
+        return { dataHandles: [handle] };
+      },
+    },
+    reindex: {
+      description:
+        "Re-scan a library to fill in missing metadata and artwork. By default uses Jellyfin's Default refresh mode, which only fetches items that are missing data — fast and cheap. Use force=true to re-query providers for every item (slow, hammers TMDB/AniDB). Library is resolved from existing inventory data — run `inventory` first if it's stale or missing.",
+      arguments: z.object({
+        library: z
+          .string()
+          .describe(
+            'Library name to reindex (e.g. "weeb shit"). Must match a library present in the latest inventory data.',
+          ),
+        force: z
+          .boolean()
+          .default(false)
+          .describe(
+            "If true, uses FullRefresh mode — re-queries providers for EVERY item, even ones with complete metadata. Slow and rate-limit-heavy. Default false uses Default mode (gaps only).",
+          ),
+        replaceMetadata: z
+          .boolean()
+          .default(false)
+          .describe(
+            "If true, wipes existing metadata before re-fetching. Default false — only fills gaps.",
+          ),
+        replaceImages: z
+          .boolean()
+          .default(false)
+          .describe(
+            "If true, wipes existing images before re-fetching. Default false — only fills gaps.",
+          ),
+      }),
+      // deno-lint-ignore no-explicit-any
+      execute: async (args: any, context: any) => {
+        const { jellyfinUrl, jellyfinApiKey } = context.globalArgs;
+        const url = jellyfinUrl.replace(/\/+$/, "");
+        const hdrs = headers(jellyfinApiKey);
+
+        // has(attributes.libraries) forces the query service to parse the JSON
+        // content — without referencing attributes the field comes back undefined.
+        const inventoryRecords = await context.queryData(
+          'modelName == "jellyfin" && specName == "inventory" && has(attributes.libraries)',
+        );
+        if (!inventoryRecords || inventoryRecords.length === 0) {
+          throw new Error(
+            "No inventory data found. Run `jellyfin inventory` first so reindex can resolve library IDs.",
+          );
+        }
+        const latestInventory = inventoryRecords
+          // deno-lint-ignore no-explicit-any
+          .sort((a: any, b: any) => b.version - a.version)[0];
+        const libraries = latestInventory.attributes?.libraries ?? [];
+
+        // deno-lint-ignore no-explicit-any
+        const match = libraries.find((l: any) => l.name === args.library);
+        if (!match) {
+          // deno-lint-ignore no-explicit-any
+          const known = libraries.map((l: any) => l.name).join(", ");
+          throw new Error(
+            `Library "${args.library}" not found in inventory. Known: ${known}`,
+          );
+        }
+
+        const refreshMode = args.force ? "FullRefresh" : "Default";
+        const params = new URLSearchParams({
+          Recursive: "true",
+          MetadataRefreshMode: refreshMode,
+          ImageRefreshMode: refreshMode,
+          ReplaceAllMetadata: String(args.replaceMetadata),
+          ReplaceAllImages: String(args.replaceImages),
+        });
+        const refreshResp = await fetch(
+          `${url}/Items/${match.libraryId}/Refresh?${params}`,
+          { method: "POST", headers: hdrs },
+        );
+        if (!refreshResp.ok) {
+          const body = await refreshResp.text();
+          throw new Error(
+            `Reindex failed for "${args.library}" (${match.libraryId}): ${refreshResp.status} ${body}`,
+          );
+        }
+
+        context.logger
+          .info`Reindex queued for "${args.library}" (${match.libraryId}), mode=${refreshMode}`;
+
+        const handle = await context.writeResource("scan", "current", {
+          timestamp: new Date().toISOString(),
+          status: "started",
+          detail:
+            `Recursive reindex queued on library "${args.library}" (mode=${refreshMode}, replaceMetadata=${args.replaceMetadata}, replaceImages=${args.replaceImages})`,
         });
 
         return { dataHandles: [handle] };
@@ -226,6 +360,115 @@ export const model = {
             episodes: totalEpisodes,
             movies: totalMovies,
           },
+        });
+
+        return { dataHandles: [handle] };
+      },
+    },
+    series: {
+      description:
+        "List all series in a library with metadata (genres, tags, overview, provider IDs) for taste matching and cross-referencing with MAL/TMDB. Library is resolved from existing inventory data — run `inventory` first if stale.",
+      arguments: z.object({
+        library: z
+          .string()
+          .describe(
+            'Library name to list (e.g. "weeb shit"). Must match a library present in the latest inventory data.',
+          ),
+      }),
+      // deno-lint-ignore no-explicit-any
+      execute: async (args: any, context: any) => {
+        const { jellyfinUrl, jellyfinApiKey } = context.globalArgs;
+        const url = jellyfinUrl.replace(/\/+$/, "");
+        const hdrs = headers(jellyfinApiKey);
+
+        const inventoryRecords = await context.queryData(
+          'modelName == "jellyfin" && specName == "inventory" && has(attributes.libraries)',
+        );
+        if (!inventoryRecords || inventoryRecords.length === 0) {
+          throw new Error(
+            "No inventory data found. Run `jellyfin inventory` first so series can resolve library IDs.",
+          );
+        }
+        const latestInventory = inventoryRecords
+          // deno-lint-ignore no-explicit-any
+          .sort((a: any, b: any) => b.version - a.version)[0];
+        const libraries = latestInventory.attributes?.libraries ?? [];
+        // deno-lint-ignore no-explicit-any
+        const match = libraries.find((l: any) => l.name === args.library);
+        if (!match) {
+          // deno-lint-ignore no-explicit-any
+          const known = libraries.map((l: any) => l.name).join(", ");
+          throw new Error(
+            `Library "${args.library}" not found in inventory. Known: ${known}`,
+          );
+        }
+
+        const usersResp = await fetch(`${url}/Users`, { headers: hdrs });
+        if (!usersResp.ok) {
+          throw new Error(`Failed to get users: ${usersResp.status}`);
+        }
+        const users = await usersResp.json();
+        if (!users || users.length === 0) throw new Error("No users found");
+        const userId = users[0].Id;
+
+        // deno-lint-ignore no-explicit-any
+        const items: any[] = [];
+        const batchSize = 200;
+        let startIndex = 0;
+        while (true) {
+          const params = new URLSearchParams({
+            ParentId: match.libraryId,
+            IncludeItemTypes: "Series",
+            Recursive: "true",
+            Fields:
+              "ProviderIds,Path,ProductionYear,Overview,Genres,Tags,Studios,CommunityRating,OfficialRating,EndDate,Status,ChildCount",
+            Limit: String(batchSize),
+            StartIndex: String(startIndex),
+          });
+          const resp = await fetch(
+            `${url}/Users/${userId}/Items?${params}`,
+            { headers: hdrs },
+          );
+          if (!resp.ok) {
+            throw new Error(`Failed to fetch series: ${resp.status}`);
+          }
+          const data = await resp.json();
+          const batch = data.Items ?? [];
+          if (batch.length === 0) break;
+          for (const s of batch) {
+            items.push({
+              id: s.Id ?? "",
+              name: s.Name ?? "",
+              path: s.Path ?? undefined,
+              productionYear: s.ProductionYear ?? undefined,
+              communityRating: s.CommunityRating ?? undefined,
+              officialRating: s.OfficialRating ?? undefined,
+              overview: s.Overview ?? undefined,
+              genres: s.Genres ?? [],
+              tags: s.Tags ?? [],
+              // deno-lint-ignore no-explicit-any
+              studios: (s.Studios ?? []).map((st: any) => st.Name ?? ""),
+              providerIds: s.ProviderIds ?? {},
+              episodeCount: s.ChildCount ?? undefined,
+              endDate: s.EndDate ?? undefined,
+              status: s.Status ?? undefined,
+            });
+          }
+          startIndex += batchSize;
+          if (startIndex >= (data.TotalRecordCount ?? 0)) break;
+        }
+
+        const instanceName = args.library
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "");
+
+        const handle = await context.writeResource("series", instanceName, {
+          timestamp: new Date().toISOString(),
+          library: args.library,
+          libraryId: match.libraryId,
+          count: items.length,
+          items,
         });
 
         return { dataHandles: [handle] };
@@ -795,7 +1038,99 @@ export const model = {
         return { dataHandles: [handle] };
       },
     },
+    encoding_config: {
+      description:
+        "Read and optionally update Jellyfin's server-wide encoding/transcoding config (EncodingOptions). Without `patch`, just reads. With `patch`, shallow-merges the object into the current config and POSTs it back. Use this to enable subtitle burn-in (needed for Samsung Tizen, which can't render ASS/SSA) by setting fields like `EncodingThreadCount`, `HardwareAccelerationType`, or codec lists. The current config is always written as a resource so you can inspect field names via `swamp data query`.",
+      arguments: z.object({
+        patch: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Shallow merge into the current EncodingOptions object. Pass field names exactly as Jellyfin's API uses them (PascalCase). Omit to just read.",
+          ),
+      }),
+      // deno-lint-ignore no-explicit-any
+      execute: async (args: any, context: any) => {
+        const { jellyfinUrl, jellyfinApiKey } = context.globalArgs;
+        const url = jellyfinUrl.replace(/\/+$/, "");
+        const hdrs = headers(jellyfinApiKey);
+
+        const getResp = await fetch(`${url}/System/Configuration/encoding`, {
+          headers: hdrs,
+        });
+        if (!getResp.ok) {
+          const body = await getResp.text();
+          throw new Error(
+            `Failed to read encoding config: ${getResp.status} ${body}`,
+          );
+        }
+        const current = await getResp.json();
+
+        let action: "read" | "updated" = "read";
+        let finalConfig = current;
+
+        if (args.patch && Object.keys(args.patch).length > 0) {
+          const merged = { ...current, ...args.patch };
+          const postResp = await fetch(
+            `${url}/System/Configuration/encoding`,
+            {
+              method: "POST",
+              headers: { ...hdrs, "Content-Type": "application/json" },
+              body: JSON.stringify(merged),
+            },
+          );
+          if (!postResp.ok) {
+            const body = await postResp.text();
+            throw new Error(
+              `Failed to update encoding config: ${postResp.status} ${body}`,
+            );
+          }
+          action = "updated";
+          finalConfig = merged;
+          context.logger.info`Updated EncodingOptions: ${
+            Object.keys(args.patch).join(", ")
+          }`;
+        } else {
+          context.logger.info`Read EncodingOptions (${
+            Object.keys(current).length
+          } fields)`;
+        }
+
+        const handle = await context.writeResource(
+          "encodingConfig",
+          "current",
+          {
+            timestamp: new Date().toISOString(),
+            action,
+            config: finalConfig,
+          },
+        );
+
+        return { dataHandles: [handle] };
+      },
+    },
   },
+  upgrades: [
+    {
+      fromVersion: "2026.03.30.1",
+      toVersion: "2026.04.11.1",
+      description: "Add reindex method; no schema changes",
+      upgradeAttributes: (old: unknown) => old,
+    },
+    {
+      fromVersion: "2026.04.11.1",
+      toVersion: "2026.04.11.2",
+      description: "Add series method and series resource spec",
+      upgradeAttributes: (old: unknown) => old,
+    },
+    {
+      fromVersion: "2026.04.11.2",
+      toVersion: "2026.04.26.1",
+      description:
+        "Add encoding_config method + encodingConfig resource spec for managing transcoding settings",
+      upgradeAttributes: (old: unknown) => old,
+    },
+  ],
 };
 
 async function getItemCount(
