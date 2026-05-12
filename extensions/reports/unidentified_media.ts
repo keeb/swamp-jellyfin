@@ -46,6 +46,7 @@ export const report = {
           type,
           step.modelId,
           handle.name,
+          handle.version,
         );
         if (!content) continue;
         try {
