@@ -2,17 +2,14 @@ export const report = {
   name: "@keeb/unidentified-media",
   description:
     "Summarize Jellyfin items with no metadata provider match after library scan",
-  scope: "method" as const,
+  scope: "workflow" as const,
   labels: ["jellyfin", "audit"],
   // deno-lint-ignore no-explicit-any
   execute: async (context: any) => {
-    const handles = context.dataHandles ?? [];
-    const modelName = context.definition.name;
-    const status = context.executionStatus;
-    const modelType = context.modelType;
-    const modelId = context.definition.id;
+    const status = context.workflowStatus;
+    let modelName = "jellyfin";
 
-    // Read the unidentified report data
+    // Walk every step in the workflow run looking for unidentified-shaped data
     let items: {
       name: string;
       path: string;
@@ -22,21 +19,25 @@ export const report = {
     }[] = [];
     let count = 0;
 
-    for (const handle of handles) {
-      const content = await context.dataRepository.getContent(
-        modelType,
-        modelId,
-        handle.name,
-      );
-      if (!content) continue;
-      try {
-        const data = JSON.parse(new TextDecoder().decode(content));
-        if (data.items) {
-          items = data.items;
-          count = data.count ?? items.length;
+    outer: for (const step of context.stepExecutions ?? []) {
+      for (const handle of step.dataHandles ?? []) {
+        const content = await context.dataRepository.getContent(
+          step.modelType,
+          step.modelId,
+          handle.name,
+        );
+        if (!content) continue;
+        try {
+          const data = JSON.parse(new TextDecoder().decode(content));
+          if (data.items) {
+            items = data.items;
+            count = data.count ?? items.length;
+            modelName = step.modelName;
+            break outer;
+          }
+        } catch {
+          /* skip */
         }
-      } catch {
-        /* skip */
       }
     }
 

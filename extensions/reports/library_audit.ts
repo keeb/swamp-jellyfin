@@ -2,33 +2,32 @@ export const report = {
   name: "@keeb/library-audit",
   description:
     "Hoarder's evaluation of Jellyfin library health — duplicates, misplacements, structural issues",
-  scope: "method" as const,
+  scope: "workflow" as const,
   labels: ["jellyfin", "audit", "hoarder"],
   // deno-lint-ignore no-explicit-any
   execute: async (context: any) => {
-    const handles = context.dataHandles ?? [];
-    const status = context.executionStatus;
-    const modelType = context.modelType;
-    const modelId = context.definition.id;
+    const status = context.workflowStatus;
 
-    // Read audit data from handles
+    // Walk every step in the workflow run looking for audit-shaped data
     // deno-lint-ignore no-explicit-any
     let audit: any = null;
-    for (const handle of handles) {
-      const content = await context.dataRepository.getContent(
-        modelType,
-        modelId,
-        handle.name,
-      );
-      if (!content) continue;
-      try {
-        const data = JSON.parse(new TextDecoder().decode(content));
-        if (data.duplicateSeries !== undefined) {
-          audit = data;
-          break;
+    outer: for (const step of context.stepExecutions ?? []) {
+      for (const handle of step.dataHandles ?? []) {
+        const content = await context.dataRepository.getContent(
+          step.modelType,
+          step.modelId,
+          handle.name,
+        );
+        if (!content) continue;
+        try {
+          const data = JSON.parse(new TextDecoder().decode(content));
+          if (data.duplicateSeries !== undefined) {
+            audit = data;
+            break outer;
+          }
+        } catch {
+          /* skip */
         }
-      } catch {
-        /* skip */
       }
     }
 
