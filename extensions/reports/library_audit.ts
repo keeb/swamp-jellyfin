@@ -1,23 +1,6 @@
-// Workflow-scope reports receive step.modelType as a string, but
-// dataRepository.getContent wants a ModelType class instance. Build a
-// minimal shim that exposes the two methods getContentPath actually calls.
-function asModelType(raw: string) {
-  const normalized = raw
-    .toLowerCase()
-    .replace(/::/g, "/")
-    .replace(/\s+/g, "/")
-    .replace(/\./g, "/")
-    .replace(/\/+/g, "/")
-    .replace(/^\/|\/$/g, "");
-  return {
-    raw,
-    normalized,
-    toDirectoryPath: () => normalized,
-    // deno-lint-ignore no-explicit-any
-    equals: (other: any) => other?.normalized === normalized,
-  };
-}
-
+// Workflow-scope reports receive step.modelType as a string; current swamp's
+// dataRepository.getContent takes that string directly and builds the ModelType
+// internally, so pass it straight through.
 export const report = {
   name: "@keeb/library-audit",
   description:
@@ -32,7 +15,7 @@ export const report = {
     // deno-lint-ignore no-explicit-any
     let audit: any = null;
     outer: for (const step of context.stepExecutions ?? []) {
-      const type = asModelType(step.modelType);
+      const type = step.modelType;
       for (const handle of step.dataHandles ?? []) {
         const content = await context.dataRepository.getContent(
           type,

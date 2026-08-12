@@ -6,6 +6,33 @@ const GlobalArgsSchema = z.object({
     .string()
     .describe("Jellyfin API key")
     .meta({ sensitive: true }),
+  libraryMap: z
+    .record(z.string(), z.string())
+    .optional()
+    .describe(
+      'Map of source mediaType → Jellyfin library name (e.g. anime → "weeb shit"). Used by reindex_recent to decide which libraries to reindex.',
+    ),
+  organizeSource: z
+    .object({
+      model: z.string().describe(
+        "Source model to read recently-processed items from",
+      ),
+      spec: z.string().describe("Resource spec on that model"),
+      mediaTypeField: z.string().describe(
+        "Attribute holding the media type key that indexes libraryMap",
+      ),
+      timestampField: z.string().describe(
+        "Attribute holding the per-item processed timestamp (ISO)",
+      ),
+      statusField: z.string().optional().describe(
+        "Optional attribute to gate on (e.g. status)",
+      ),
+      statusValue: z.string().optional().describe(
+        "Required value of statusField to count an item",
+      ),
+    })
+    .optional()
+    .describe("Where reindex_recent reads 'what was just organized' from"),
 });
 
 const LibrarySchema = z.object({
@@ -76,9 +103,37 @@ function headers(apiKey: string): Record<string, string> {
   return { "X-Emby-Token": apiKey };
 }
 
+/** Canonical Jellyfin ProviderIds keys, indexed by lowercase alias. */
+const PROVIDER_KEYS: Record<string, string> = {
+  imdb: "Imdb",
+  tmdb: "Tmdb",
+  tvdb: "Tvdb",
+  anidb: "AniDB",
+  anilist: "AniList",
+  mal: "MyAnimeList",
+  myanimelist: "MyAnimeList",
+};
+
+/**
+ * Pull provider IDs out of a mapping value, normalizing key casing.
+ * Unrecognized keys pass through untouched so new providers still work.
+ */
+function normalizeProviderIds(
+  spec: Record<string, unknown>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(spec)) {
+    const lower = k.toLowerCase();
+    if (lower === "name" || lower === "year") continue;
+    if (v === null || v === undefined) continue;
+    out[PROVIDER_KEYS[lower] ?? k] = String(v);
+  }
+  return out;
+}
+
 export const model = {
   type: "@keeb/jellyfin",
-  version: "2026.04.26.1",
+  version: "2026.08.12.1",
   reports: ["@keeb/unidentified-media", "@keeb/library-audit"],
   globalArguments: GlobalArgsSchema,
   resources: {
@@ -93,6 +148,16 @@ export const model = {
       schema: ScanResultSchema,
       lifetime: "7d" as const,
       garbageCollection: 20,
+    },
+    reindexWatermark: {
+      description:
+        "High-water mark for reindex_recent — timestamp of the last run and the libraries it reindexed",
+      schema: z.object({
+        lastReindexAt: z.iso.datetime(),
+        libraries: z.array(z.string()),
+      }),
+      lifetime: "infinite" as const,
+      garbageCollection: 5,
     },
     unidentified: {
       description: "Items Jellyfin could not match to a metadata provider",
@@ -267,23 +332,11 @@ export const model = {
         }
 
         const refreshMode = args.force ? "FullRefresh" : "Default";
-        const params = new URLSearchParams({
-          Recursive: "true",
-          MetadataRefreshMode: refreshMode,
-          ImageRefreshMode: refreshMode,
-          ReplaceAllMetadata: String(args.replaceMetadata),
-          ReplaceAllImages: String(args.replaceImages),
+        await refreshLibrary(url, hdrs, match.libraryId, {
+          mode: refreshMode,
+          replaceMetadata: args.replaceMetadata,
+          replaceImages: args.replaceImages,
         });
-        const refreshResp = await fetch(
-          `${url}/Items/${match.libraryId}/Refresh?${params}`,
-          { method: "POST", headers: hdrs },
-        );
-        if (!refreshResp.ok) {
-          const body = await refreshResp.text();
-          throw new Error(
-            `Reindex failed for "${args.library}" (${match.libraryId}): ${refreshResp.status} ${body}`,
-          );
-        }
 
         context.logger
           .info`Reindex queued for "${args.library}" (${match.libraryId}), mode=${refreshMode}`;
@@ -295,6 +348,238 @@ export const model = {
             `Recursive reindex queued on library "${args.library}" (mode=${refreshMode}, replaceMetadata=${args.replaceMetadata}, replaceImages=${args.replaceImages})`,
         });
 
+        return { dataHandles: [handle] };
+      },
+    },
+    reindex_recent: {
+      description:
+        "Smart reindex: read recently-organized items from the configured organizeSource, map their mediaType to Jellyfin libraries via libraryMap, and Default-mode reindex only the touched libraries. Advances a watermark each run so the next run only sees items processed since. Use seedWatermark=true on first run to skip the backlog.",
+      arguments: z.object({
+        seedWatermark: z
+          .boolean()
+          .default(false)
+          .describe(
+            "If true, skip all reindexing and just set the watermark to now. Use once on first run so the whole historical backlog isn't reindexed.",
+          ),
+        force: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Use FullRefresh mode (re-query every provider) instead of Default (gaps only).",
+          ),
+        settleSeconds: z
+          .number()
+          .default(45)
+          .describe(
+            "After firing refreshes, wait for the scan to be continuously idle this long before returning. 0 disables the wait (fire-and-forget).",
+          ),
+        timeoutSeconds: z
+          .number()
+          .default(1800)
+          .describe("Hard cap on the post-refresh settle wait."),
+        pollSeconds: z
+          .number()
+          .default(10)
+          .describe("Seconds between settle polls."),
+      }),
+      // deno-lint-ignore no-explicit-any
+      execute: async (args: any, context: any) => {
+        const { jellyfinUrl, jellyfinApiKey, libraryMap, organizeSource } =
+          context.globalArgs;
+        if (!libraryMap || !organizeSource) {
+          throw new Error(
+            "reindex_recent requires `libraryMap` and `organizeSource` in the jellyfin model's globalArguments.",
+          );
+        }
+        const url = jellyfinUrl.replace(/\/+$/, "");
+        const hdrs = headers(jellyfinApiKey);
+        const now = new Date().toISOString();
+
+        // Read the current watermark (default to epoch if none yet).
+        const wmRecords = await context.queryData(
+          'modelName == "jellyfin" && specName == "reindexWatermark" && has(attributes.lastReindexAt)',
+        );
+        const lastReindexAt = (wmRecords && wmRecords.length)
+          // deno-lint-ignore no-explicit-any
+          ? wmRecords.sort((a: any, b: any) => b.version - a.version)[0]
+            .attributes.lastReindexAt
+          : "1970-01-01T00:00:00.000Z";
+
+        if (args.seedWatermark) {
+          const handle = await context.writeResource(
+            "reindexWatermark",
+            "watermark",
+            { lastReindexAt: now, libraries: [] },
+          );
+          context.logger
+            .info`Seeded reindex watermark to ${now}; nothing reindexed`;
+          return { dataHandles: [handle] };
+        }
+
+        // Collect libraries touched since the watermark.
+        const {
+          model: srcModel,
+          spec: srcSpec,
+          mediaTypeField,
+          timestampField,
+          statusField,
+          statusValue,
+        } = organizeSource;
+        const records = await context.queryData(
+          `modelName == "${srcModel}" && specName == "${srcSpec}" && has(attributes.${mediaTypeField})`,
+        );
+        const touched = new Set<string>();
+        for (const r of records ?? []) {
+          const a = r.attributes ?? {};
+          if (statusField && a[statusField] !== statusValue) continue;
+          if (timestampField && !(a[timestampField] > lastReindexAt)) continue;
+          const lib = libraryMap[a[mediaTypeField]];
+          if (lib) touched.add(lib);
+        }
+
+        if (touched.size === 0) {
+          const handle = await context.writeResource(
+            "reindexWatermark",
+            "watermark",
+            { lastReindexAt: now, libraries: [] },
+          );
+          context.logger
+            .info`No libraries touched since ${lastReindexAt}; watermark advanced to ${now}`;
+          return { dataHandles: [handle] };
+        }
+
+        // Resolve library IDs live from Jellyfin. Reading them from stored
+        // `inventory` data would be fragile inside a workflow run — an earlier
+        // step's writeResource output isn't queryable by this step until the
+        // run commits — so hit the API directly, like `inventory` does.
+        const libResp = await fetch(`${url}/Library/VirtualFolders`, {
+          headers: hdrs,
+        });
+        if (!libResp.ok) {
+          throw new Error(
+            `Failed to list Jellyfin libraries: ${libResp.status} ${await libResp
+              .text()}`,
+          );
+        }
+        // deno-lint-ignore no-explicit-any
+        const libraries: any[] = await libResp.json();
+
+        const mode = args.force ? "FullRefresh" : "Default";
+        const handles = [];
+        const done: string[] = [];
+        for (const name of touched) {
+          const match = libraries.find((l) => l.Name === name);
+          if (!match) {
+            const known = libraries.map((l) => l.Name).join(", ");
+            context.logger
+              .info`Touched library "${name}" not found in Jellyfin (have: ${known}) — skipping`;
+            continue;
+          }
+          await refreshLibrary(url, hdrs, match.ItemId, {
+            mode,
+            replaceMetadata: false,
+            replaceImages: false,
+          });
+          context.logger
+            .info`Reindex queued for "${name}" (${match.ItemId}, mode=${mode})`;
+          done.push(name);
+        }
+
+        // Wait for the refreshes to settle before returning, so a downstream
+        // audit sees the reindexed state. Done here (not a separate step)
+        // because only this method knows a refresh actually fired — a later
+        // step can't see this run's uncommitted `scan` output via queryData.
+        let settleDetail = "wait skipped (settleSeconds=0)";
+        if (done.length > 0 && args.settleSeconds > 0) {
+          const settle = await waitForScanSettle(url, hdrs, {
+            settleSeconds: args.settleSeconds,
+            timeoutSeconds: args.timeoutSeconds,
+            pollSeconds: args.pollSeconds,
+          });
+          settleDetail = settle.detail;
+          context.logger.info(settle.detail);
+        }
+
+        handles.push(
+          await context.writeResource("scan", "current", {
+            timestamp: now,
+            status: "completed",
+            detail: `reindex_recent queued: ${
+              done.join(", ")
+            } (mode=${mode}); ${settleDetail}`,
+          }),
+        );
+        handles.push(
+          await context.writeResource("reindexWatermark", "watermark", {
+            lastReindexAt: now,
+            libraries: done,
+          }),
+        );
+        return { dataHandles: handles };
+      },
+    },
+    scan_status: {
+      description:
+        "Wait for Jellyfin to settle after a reindex before auditing. If no reindex was queued in the last `recentMinutes` (no recent `scan` resource with status 'started'), returns immediately — nothing to wait for. Otherwise it truly waits out any running RefreshLibrary scheduled task (the `refresh`/full-scan path), then applies a bounded `settleSeconds` idle window. NOTE: Jellyfin exposes no completion signal for item-tree metadata refreshes (what `reindex`/`reindex_recent` trigger) — those never register as a scheduled task — so for that path the settle window is the effective wait, not true completion detection.",
+      arguments: z.object({
+        settleSeconds: z
+          .number()
+          .default(45)
+          .describe(
+            "Require the RefreshLibrary task to be continuously idle for this long before returning. For item-tree refreshes (no task signal) this is the effective settle wait.",
+          ),
+        recentMinutes: z
+          .number()
+          .default(15)
+          .describe(
+            "Only wait if a reindex was queued within this many minutes; otherwise return immediately.",
+          ),
+        timeoutSeconds: z
+          .number()
+          .default(1800)
+          .describe("Hard cap on total wait before giving up."),
+        pollSeconds: z
+          .number()
+          .default(10)
+          .describe("Seconds between polls."),
+      }),
+      // deno-lint-ignore no-explicit-any
+      execute: async (args: any, context: any) => {
+        const { jellyfinUrl, jellyfinApiKey } = context.globalArgs;
+        const url = jellyfinUrl.replace(/\/+$/, "");
+        const hdrs = headers(jellyfinApiKey);
+
+        // Skip the wait entirely if nothing was reindexed recently. reindex /
+        // reindex_recent write a `scan` resource with status "started"; a no-op
+        // reindex_recent writes none, so there's nothing to settle.
+        const cutoff = new Date(Date.now() - args.recentMinutes * 60 * 1000)
+          .toISOString();
+        const recent = await context.queryData(
+          `modelName == "jellyfin" && specName == "scan" && attributes.status == "started" && attributes.timestamp > "${cutoff}"`,
+        );
+        if (!recent || recent.length === 0) {
+          const handle = await context.writeResource("scan", "current", {
+            timestamp: new Date().toISOString(),
+            status: "completed",
+            detail:
+              `No reindex queued in the last ${args.recentMinutes}m — nothing to wait for`,
+          });
+          context.logger
+            .info`No recent reindex; scan_status returning immediately`;
+          return { dataHandles: [handle] };
+        }
+
+        const { settled, detail } = await waitForScanSettle(url, hdrs, {
+          settleSeconds: args.settleSeconds,
+          timeoutSeconds: args.timeoutSeconds,
+          pollSeconds: args.pollSeconds,
+        });
+        const handle = await context.writeResource("scan", "current", {
+          timestamp: new Date().toISOString(),
+          status: settled ? "completed" : "failed",
+          detail,
+        });
+        context.logger.info(detail);
         return { dataHandles: [handle] };
       },
     },
@@ -852,7 +1137,7 @@ export const model = {
         mappings: z
           .string()
           .describe(
-            'JSON object mapping current item name (or path substring) to search query, e.g. {"dragonball-z-remastered":"Dragon Ball Z"}. If the key contains "/" it matches against the item path instead of name.',
+            'JSON object mapping current item name (or path substring) to either a search query string, e.g. {"dragonball-z-remastered":"Dragon Ball Z"}, or an object pinning explicit provider IDs, e.g. {"bleach-tybw":{"imdb":"tt14986406","name":"Bleach: Thousand-Year Blood War"}}. Accepted ID keys: imdb, tmdb, tvdb, anidb, anilist, mal (plus optional name/year to seed the search). When IDs are pinned, only a result carrying those exact IDs is applied — an unpinned first result is never used. If the key contains "/" it matches against the item path instead of name.',
           ),
         dryRun: z.boolean().default(false).describe(
           "Search only, don't apply matches",
@@ -864,18 +1149,34 @@ export const model = {
         const url = jellyfinUrl.replace(/\/+$/, "");
         const hdrs = headers(jellyfinApiKey);
 
-        const mappings: Record<string, string> = JSON.parse(args.mappings);
+        const mappings: Record<string, string | Record<string, unknown>> = JSON
+          .parse(args.mappings);
         // deno-lint-ignore no-explicit-any
         const results: any[] = [];
         let matched = 0;
         let failed = 0;
 
-        for (const [currentKey, searchQuery] of Object.entries(mappings)) {
+        for (const [currentKey, spec] of Object.entries(mappings)) {
+          const isPinned = typeof spec === "object" && spec !== null;
+          const pinnedIds = isPinned
+            ? normalizeProviderIds(spec as Record<string, unknown>)
+            : null;
+          const pinnedYear = isPinned
+            ? (spec as Record<string, unknown>).year
+            : undefined;
+          // Search string: explicit name when pinned, else the bare query.
+          // Falls back to the item's own name once we've located it.
+          let searchQuery = isPinned
+            ? String((spec as Record<string, unknown>).name ?? "")
+            : (spec as string);
+
           const matchByPath = currentKey.includes("/");
           context.logger
-            .info`Identifying "${currentKey}" → searching "${searchQuery}" (match by ${
-            matchByPath ? "path" : "name"
-          })`;
+            .info`Identifying "${currentKey}" → ${
+            pinnedIds && Object.keys(pinnedIds).length > 0
+              ? `pinned ${JSON.stringify(pinnedIds)}`
+              : `searching "${searchQuery}"`
+          } (match by ${matchByPath ? "path" : "name"})`;
 
           // Find the item in Jellyfin
           // deno-lint-ignore no-explicit-any
@@ -947,14 +1248,27 @@ export const model = {
           const itemId = item.Id;
           const itemType = item.Type === "Movie" ? "Movie" : "Series";
 
-          // Search metadata providers
+          // A pinned mapping may omit `name`; the item's own name seeds the search.
+          if (!searchQuery) searchQuery = item.Name ?? currentKey;
+
+          // Search metadata providers. Pinned IDs go into SearchInfo so
+          // providers can resolve the exact entry rather than a title guess.
+          // deno-lint-ignore no-explicit-any
+          const searchInfo: any = { Name: searchQuery };
+          if (pinnedIds && Object.keys(pinnedIds).length > 0) {
+            searchInfo.ProviderIds = pinnedIds;
+          }
+          if (pinnedYear !== undefined && pinnedYear !== null) {
+            searchInfo.Year = Number(pinnedYear);
+          }
+
           const searchResp = await fetch(
             `${url}/Items/RemoteSearch/${itemType}`,
             {
               method: "POST",
               headers: { ...hdrs, "Content-Type": "application/json" },
               body: JSON.stringify({
-                SearchInfo: { Name: searchQuery },
+                SearchInfo: searchInfo,
                 IncludeDisabledProviders: false,
               }),
             },
@@ -983,7 +1297,36 @@ export const model = {
             continue;
           }
 
-          const best = searchResults[0];
+          // Unpinned: keep the historical first-result behavior.
+          // Pinned: only a result carrying every pinned ID is acceptable.
+          // Refusing here is the point — applying result[0] is exactly how a
+          // parent series gets stamped onto a cour that shares no ID with it.
+          let best = searchResults[0];
+          if (pinnedIds && Object.keys(pinnedIds).length > 0) {
+            // deno-lint-ignore no-explicit-any
+            const hit = searchResults.find((r: any) => {
+              const ids = r.ProviderIds ?? {};
+              return Object.entries(pinnedIds).every(([k, v]) =>
+                String(ids[k] ?? "").toLowerCase() === v.toLowerCase()
+              );
+            });
+            if (!hit) {
+              context.logger
+                .warn`No result matching pinned IDs ${
+                JSON.stringify(pinnedIds)
+              } for "${currentKey}" — refusing to apply "${
+                searchResults[0]?.Name ?? "unknown"
+              }"`;
+              results.push({
+                name: currentKey,
+                searchQuery,
+                status: "no_results",
+              });
+              failed++;
+              continue;
+            }
+            best = hit;
+          }
           const providerIds = best.ProviderIds ?? {};
 
           if (!args.dryRun) {
@@ -1130,8 +1473,98 @@ export const model = {
         "Add encoding_config method + encodingConfig resource spec for managing transcoding settings",
       upgradeAttributes: (old: unknown) => old,
     },
+    {
+      fromVersion: "2026.04.26.1",
+      toVersion: "2026.07.14.1",
+      description:
+        "Add reindex_recent + scan_status methods, reindexWatermark resource, and libraryMap/organizeSource globalArgs; no schema changes to existing resources",
+      upgradeAttributes: (old: unknown) => old,
+    },
+    {
+      fromVersion: "2026.07.14.1",
+      toVersion: "2026.08.12.1",
+      description:
+        "identify mappings accept an object pinning explicit provider IDs (imdb/tmdb/tvdb/anidb/anilist/mal, plus optional name/year); pinned lookups refuse to apply a result that lacks those IDs instead of falling back to the first hit. String mappings behave as before; no schema changes",
+      upgradeAttributes: (old: unknown) => old,
+    },
   ],
 };
+
+async function refreshLibrary(
+  url: string,
+  hdrs: Record<string, string>,
+  libraryId: string,
+  opts: { mode: string; replaceMetadata: boolean; replaceImages: boolean },
+): Promise<void> {
+  const params = new URLSearchParams({
+    Recursive: "true",
+    MetadataRefreshMode: opts.mode,
+    ImageRefreshMode: opts.mode,
+    ReplaceAllMetadata: String(opts.replaceMetadata),
+    ReplaceAllImages: String(opts.replaceImages),
+  });
+  const resp = await fetch(`${url}/Items/${libraryId}/Refresh?${params}`, {
+    method: "POST",
+    headers: hdrs,
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(
+      `Reindex failed for library ${libraryId}: ${resp.status} ${body}`,
+    );
+  }
+}
+
+// Wait for Jellyfin to settle after a refresh. Truly waits out a running
+// RefreshLibrary scheduled task (the full-scan path); for item-tree refreshes,
+// which Jellyfin never surfaces as a task, applies a bounded idle settle.
+async function waitForScanSettle(
+  url: string,
+  hdrs: Record<string, string>,
+  opts: { settleSeconds: number; timeoutSeconds: number; pollSeconds: number },
+): Promise<{ settled: boolean; detail: string; waited: number }> {
+  const deadline = Date.now() + opts.timeoutSeconds * 1000;
+  const start = Date.now();
+  let state = "Unknown";
+  let idleSince: number | null = null;
+  let sawRunning = false;
+
+  while (Date.now() < deadline) {
+    const resp = await fetch(`${url}/ScheduledTasks`, { headers: hdrs });
+    if (!resp.ok) {
+      throw new Error(
+        `Failed to query scheduled tasks: ${resp.status} ${await resp.text()}`,
+      );
+    }
+    const tasks = await resp.json();
+    // deno-lint-ignore no-explicit-any
+    const scan = (tasks ?? []).find((t: any) => t.Key === "RefreshLibrary");
+    state = scan?.State ?? "Unknown";
+
+    if (state === "Running") {
+      sawRunning = true;
+      idleSince = null;
+    } else {
+      if (idleSince === null) idleSince = Date.now();
+      if (Date.now() - idleSince >= opts.settleSeconds * 1000) break;
+    }
+    await new Promise((r) => setTimeout(r, opts.pollSeconds * 1000));
+  }
+
+  const settled = idleSince !== null &&
+    Date.now() - idleSince >= opts.settleSeconds * 1000;
+  const waited = Math.round((Date.now() - start) / 1000);
+  const detail = settled
+    ? `Settled after ~${waited}s${
+      sawRunning
+        ? " (waited out a running library scan)"
+        : " (bounded settle; item refresh has no completion signal)"
+    }`
+    : `scan_status timed out after ${opts.timeoutSeconds}s (last task state=${state}${
+      sawRunning ? ", a scan was still running" : ""
+    })`;
+  return { settled, detail, waited };
+}
 
 async function getItemCount(
   url: string,
